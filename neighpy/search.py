@@ -5,6 +5,7 @@ from joblib import Parallel, delayed
 from tqdm import tqdm
 from os import cpu_count
 import os
+import shutil
 
 import time
 import subprocess
@@ -18,13 +19,24 @@ def jobs_running_slurm(job_ids):
     return bool(result.stdout.strip())
 
 
-def jobs_running_pbs(job_ids):
-    result = subprocess.run(["qstat"], capture_output=True, text=True)
-    # qstat output contains job IDs in the first column
-    # be careful here, this very much depends on the server that you are running on.
-    running_ids = {line.split()[0] for line in result.stdout.strip().splitlines()[2:]}  # skip header
-    running_job_numbers = {rid.split('.', 1)[0] for rid in running_ids}
-    return any(jid in running_job_numbers for jid in job_ids)
+def jobs_running(job_ids,scheduler):
+
+    if scheduler == "pbs":
+        result = subprocess.run(["qstat"], capture_output=True, text=True)
+        # qstat output contains job IDs in the first column
+        # be careful here, this very much depends on the server that you are running on.
+        running_ids = {line.split()[0] for line in result.stdout.strip().splitlines()[2:]}  # skip header
+        running_job_numbers = {rid.split('.', 1)[0] for rid in running_ids}
+        return any(jid in running_job_numbers for jid in job_ids)
+    elif scheduler == "slurm":
+        result = subprocess.run(["squeue", "--noheader", "--jobs", ",".join(job_ids)],
+            capture_output=True, text=True)
+        return bool(result.stdout.strip())
+        # result = subprocess.run(["squeue", "--noheader", "-o", "%A"], capture_output=True, text=True)
+        # running_ids = set(result.stdout.strip().splitlines())
+        # return any(jid in running_ids for jid in job_ids)
+    else:
+        raise RuntimeError("No valid scheduler provided.")
 
 
 def read_misfit(filename="misfit.txt"):
@@ -80,6 +92,7 @@ class NASearcher:
     ) -> None:
         self._objective = objective
         self.objective_args = args
+        self.scheduler = None
 
         self.ns = ns  # number of samples generated at each iteration
         self.nr = nr  # number of cells to resample
@@ -183,7 +196,7 @@ class NASearcher:
                 print(f"Execution time random walk: {t2 - t1:.6f} seconds")
                 print(f"Execution time update ensemble: {t3 - t2:.6f} seconds")
 
-    def run_external_queue(self, parallel=True) -> None:
+    def run_external_queue(self, parallel=True, restart=False) -> None:
         """
         Run the Direct Search.
 
@@ -193,10 +206,23 @@ class NASearcher:
         - **objectives** (`NDArray`) - objective function values for each sample.
 
         """
+        # check which scheduler is used:
+        if shutil.which("sbatch"):
+            self.scheduler = "slurm"
+            print("Detected slurm scheduler for job submission. Using slurm submission.")
+        elif shutil.which("qsub"):
+            self.scheduler = "pbs"
+            print("Detected PBS scheduler for job submission. Using slurm submission.")
+        else:
+            raise RuntimeError("Neither Slurm (sbatch) nor PBS (qsub) detected on this system.")
+
         # initial random search
-        print("NAI - Initial Random Search")
-        new_samples = self._initial_random_search()
-        self._update_ensemble_external_queue(new_samples)
+        if not restart:
+            print("NAI - Initial Random Search")
+            new_samples = self._initial_random_search()
+            self._update_ensemble_external_queue(new_samples)
+        else:
+            print("Restarting NAI - skipping initial random search and using loaded samples and objectives as initial population.")
 
         n_jobs = min(self.nr, cpu_count()) if parallel else 1
         # print("cpu_count is",cpu_count())
@@ -318,21 +344,31 @@ class NASearcher:
         self.samples[self.np : self.np + n] = new_samples
         job_ids = []
         print('new_samples',new_samples)
-        script =  self.parentdir + '/' + 'SingleRun.pbs'
+        script =  self.parentdir + '/' + 'SingleRun.sh'
 
         #!!! submit jobs
+        # first create new folders, then submit jobs
         for i in range(n):
             iterationstr = 'Model'+str(self.np + i)
             os.makedirs(self.singlerundir + '/' + iterationstr, exist_ok=True) # make new folder for model
             with open(self.singlerundir + '/' + iterationstr +'/variables.txt', 'w') as f: # write new_sample to file
                 f.write(str(new_samples[i]))
 
-            result = subprocess.run(["qsub", '-F', f"{self.parentdir} {self.singlerundir} {iterationstr}", script], capture_output=True, text=True) # this script needs to run a job, do post-proc, and copy the resulting misfit back to the parent folder
-            # qsub or sbatch
+        for i in range(n):
+            iterationstr = 'Model'+str(self.np + i)
+            print('submitting job with i=',i)
+            if self.scheduler == "pbs":
+                result = subprocess.run(["qsub", '-F', f"{self.parentdir} {self.singlerundir} {iterationstr}", script], capture_output=True, text=True) # this script needs to run a job, do post-proc, and copy the resulting misfit back to the parent folder
+                match = re.match(r"(\d+)", result.stdout.strip())
+            elif self.scheduler == "slurm":
+                # Slurm returns: "Submitted batch job 123456"
+                result = subprocess.run(["sbatch", "--export=ALL", script, self.parentdir, self.singlerundir, iterationstr], capture_output=True, text=True)  # this script needs to run a job, do post-proc, and copy the resulting misfit back to the parent folder
+                #time.sleep(5)
+                match = re.search(r"Submitted batch job (\d+)", result.stdout)
+            else:
+                raise RuntimeError("Neither Slurm (sbatch) nor PBS (qsub) scheduler provided.")
 
-            # Example sbatch output: "Submitted batch job 123456"
-            #match = re.search(r"Submitted batch job (\d+)", result.stdout) # SLURM
-            match = re.match(r"(\d+)", result.stdout.strip())
+
             if match:
                 job_id = match.group(1)
                 job_ids.append(job_id)
@@ -343,7 +379,7 @@ class NASearcher:
 
          #!!! Wait that all jobs are completed
         print("Waiting for jobs to finish...")
-        while jobs_running_pbs(job_ids): # slurm or pbs
+        while jobs_running(job_ids,self.scheduler): # slurm or pbs
             # print("Still running...")
             time.sleep(30)  # Wait 10 seconds before checking again
         print("All queue jobs completed.")
